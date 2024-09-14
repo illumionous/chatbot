@@ -10,6 +10,8 @@ from zhipuai import ZhipuAI
 import uuid
 import asyncio
 import jieba
+from fastapi.responses import StreamingResponse
+import re 
 
 app = FastAPI()
 
@@ -93,34 +95,66 @@ if not zhipuai_api_key:
     raise ValueError("请设置 ZHIPUAI_API_KEY 环境变量")
 zhipuai_wrapper = ZhipuAIWrapper(zhipuai_api_key)
 
-@app.get("/knowledge/chat")
-async def chat(request: Request, query: str):
-    # 在知识库中搜索相关问答对
-    results = kb.search(query, top_k=5)
-
-    # 准备上下文，只使用相似度大于 0.3 的结果
+@app.post("/knowledge/chat")
+async def chat(request: ChatRequest):
+    results = kb.search(request.query, top_k=5)
     context = "\n\n".join([f"Q: {r['question']}\nA: {r['answer']}" for r in results if r['similarity'] > 0.3])
 
-    # 生成响应
-    response = zhipuai_wrapper.generate_response(query, context)
+    prompt = f"""上下文:\n{context}\n\n问题: {request.query}\n\n请提供详细回答，并在回答结束后，给出一个用于生成图表的JSON数据。
+    JSON数据应包含与回答相关的统计信息，格式如下:
+    {{
+        "title": {{"text": "图表标题"}},
+        "data": [
+            {{"name": "类别1", "value": 数值1}},
+            {{"name": "类别2", "value": 数值2}},
+            ...
+        ]
+    }}
+    请确保JSON数据与回答内容紧密相关。回答:"""
 
-    async def event_generator():
+    response = zhipuai_wrapper.generate_response(request.query, prompt)
+
+    message_id = str(uuid.uuid4())
+
+    async def stream_response():
+        full_response = ""
         try:
             for chunk in response:
                 if hasattr(chunk.choices[0].delta, 'content'):
                     content = chunk.choices[0].delta.content
                     if content:
-                        yield {"event": "message", "data": json.dumps({"text": content}, ensure_ascii=False)}
+                        full_response += content
+                        yield f"data: {json.dumps({'message_id': message_id, 'text': content}, ensure_ascii=False)}\n\n"
             
-            # 在流式响应的最后发送检索到的知识
-            yield {"event": "knowledge", "data": json.dumps({"retrieved_knowledge": results}, ensure_ascii=False)}
-            yield {"event": "close", "data": ""}
+            # 提取JSON数据
+            json_match = re.search(r'\{[\s\S]*\}', full_response)
+            if json_match:
+                json_data = json.loads(json_match.group())
+                echarts_data = {
+                    'title': json_data['title'],
+                    'tooltip': {'trigger': 'item', 'formatter': '{a} <br/>{b} : {c} ({d}%)'},
+                    'legend': {'orient': 'vertical', 'left': 'left', 'data': [item['name'] for item in json_data['data']]},
+                    'series': [{
+                        'name': '统计数据',
+                        'type': 'pie',
+                        'radius': '55%',
+                        'center': ['50%', '60%'],
+                        'data': json_data['data'],
+                        'itemStyle': {
+                            'emphasis': {
+                                'shadowBlur': 10,
+                                'shadowOffsetX': 0,
+                                'shadowColor': 'rgba(0, 0, 0, 0.5)'
+                            }
+                        }
+                    }]
+                }
+                yield f"data: {json.dumps({'message_id': message_id, 'echarts': json.dumps(echarts_data)}, ensure_ascii=False)}\n\n"
         except Exception as e:
             print(f"流式响应中出现错误: {str(e)}")
-            yield {"event": "error", "data": json.dumps({"error": str(e)}, ensure_ascii=False)}
-            yield {"event": "close", "data": ""}
+            yield f"data: {json.dumps({'message_id': message_id, 'error': str(e)}, ensure_ascii=False)}\n\n"
 
-    return EventSourceResponse(event_generator())
+    return StreamingResponse(stream_response(), media_type="text/event-stream")
 
 if __name__ == "__main__":
     import uvicorn
