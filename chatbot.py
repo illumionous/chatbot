@@ -3,9 +3,9 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import json
 import os
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
-from fastapi.responses import StreamingResponse
+from sse_starlette.sse import EventSourceResponse
 from zhipuai import ZhipuAI
 import uuid
 import asyncio
@@ -72,7 +72,7 @@ class ZhipuAIWrapper:
         response = self.client.chat.completions.create(
             model="glm-4-0520",
             messages=[
-                {"role": "system", "content": "你是一个有帮助的助手。使用提供的上下文来回答问题。"},
+                {"role": "system", "content": "你是一个有帮助的助手,来自九天大模型。使用提供的上下文来回答问题。"},
                 {"role": "user", "content": prompt}
             ],
             stream=True
@@ -93,36 +93,34 @@ if not zhipuai_api_key:
     raise ValueError("请设置 ZHIPUAI_API_KEY 环境变量")
 zhipuai_wrapper = ZhipuAIWrapper(zhipuai_api_key)
 
-@app.post("/knowledge/chat")
-async def chat(request: ChatRequest):
+@app.get("/knowledge/chat")
+async def chat(request: Request, query: str):
     # 在知识库中搜索相关问答对
-    results = kb.search(request.query, top_k=5)
+    results = kb.search(query, top_k=5)
 
     # 准备上下文，只使用相似度大于 0.3 的结果
     context = "\n\n".join([f"Q: {r['question']}\nA: {r['answer']}" for r in results if r['similarity'] > 0.3])
 
     # 生成响应
-    response = zhipuai_wrapper.generate_response(request.query, context)
+    response = zhipuai_wrapper.generate_response(query, context)
 
-    message_id = str(uuid.uuid4())
-
-    async def stream_response():
+    async def event_generator():
         try:
             for chunk in response:
                 if hasattr(chunk.choices[0].delta, 'content'):
                     content = chunk.choices[0].delta.content
                     if content:
-                        yield f"data: {json.dumps({'message_id': message_id, 'text': content}, ensure_ascii=False)}\n\n"
+                        yield {"event": "message", "data": json.dumps({"text": content}, ensure_ascii=False)}
             
             # 在流式响应的最后发送检索到的知识
-            yield f"data: {json.dumps({'message_id': message_id, 'retrieved_knowledge': results}, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
+            yield {"event": "knowledge", "data": json.dumps({"retrieved_knowledge": results}, ensure_ascii=False)}
+            yield {"event": "close", "data": ""}
         except Exception as e:
             print(f"流式响应中出现错误: {str(e)}")
-            yield f"data: {json.dumps({'message_id': message_id, 'error': str(e)}, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
+            yield {"event": "error", "data": json.dumps({"error": str(e)}, ensure_ascii=False)}
+            yield {"event": "close", "data": ""}
 
-    return StreamingResponse(stream_response(), media_type="text/event-stream")
+    return EventSourceResponse(event_generator())
 
 if __name__ == "__main__":
     import uvicorn
