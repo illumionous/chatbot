@@ -15,7 +15,7 @@ zhipuai
 jieba
 
 使用以下命令安装这些依赖：
-pip install numpy scikit-learn fastapi pydantic zhipuai jieba
+pip install numpy scikit-learn fastapi pydantic zhipuai jieba sse-starlette
 使用方法
 
 生成问答对：
