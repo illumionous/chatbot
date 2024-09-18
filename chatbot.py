@@ -3,16 +3,17 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import json
 import os
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Query
 from pydantic import BaseModel
-from sse_starlette.sse import EventSourceResponse
 from zhipuai import ZhipuAI
 import uuid
-import asyncio
 import jieba
 from fastapi.responses import StreamingResponse
-import re 
+import asyncio
+import re
+import time
 
+DEBUG = 1
 app = FastAPI()
 
 class KnowledgeBase:
@@ -40,7 +41,6 @@ class KnowledgeBase:
         query_vector = self.vectorizer.transform([query])
         similarities = cosine_similarity(query_vector, self.vectors)[0]
         
-        # 获取相似度排序后的索引
         sorted_indices = np.argsort(similarities)[::-1]
         
         results = []
@@ -53,7 +53,6 @@ class KnowledgeBase:
             question = self.qa_pairs[idx]["question"]
             answer = self.qa_pairs[idx]["answer"]
             
-            # 检查是否已经有相同的问题
             if question not in seen_questions:
                 results.append({
                     "question": question,
@@ -68,19 +67,23 @@ class ZhipuAIWrapper:
     def __init__(self, api_key):
         self.client = ZhipuAI(api_key=api_key)
 
-    def generate_response(self, query, context):
+    async def generate_response(self, query, context):
         prompt = f"上下文:\n{context}\n\n问题: {query}\n\n回答:"
 
-        response = self.client.chat.completions.create(
-            model="glm-4-0520",
-            messages=[
-                {"role": "system", "content": "你是一个有帮助的助手,来自九天大模型。使用提供的上下文来回答问题。"},
-                {"role": "user", "content": prompt}
-            ],
-            stream=True
-        )
-
-        return response
+        try:
+            response = await asyncio.to_thread(
+                self.client.chat.completions.create,
+                model="glm-4-0520",
+                messages=[
+                    {"role": "system", "content": "你是一个有帮助的助手,来自九天大模型。使用提供的上下文来回答问题。"},
+                    {"role": "user", "content": prompt}
+                ],
+                stream=True
+            )
+            return response
+        except Exception as e:
+            print(f"ZhipuAI API error: {str(e)}")
+            return None
 
 class ChatRequest(BaseModel):
     query: str
@@ -97,64 +100,69 @@ zhipuai_wrapper = ZhipuAIWrapper(zhipuai_api_key)
 
 @app.post("/knowledge/chat")
 async def chat(request: ChatRequest):
+    search_start = time.time()
     results = kb.search(request.query, top_k=5)
-    context = "\n\n".join([f"Q: {r['question']}\nA: {r['answer']}" for r in results if r['similarity'] > 0.3])
+    search_end = time.time()
+    search_time = search_end - search_start
+    
+    context = "\n\n".join([f"Q: {r['question']}\nA: {r['answer']}" for r in results if r['similarity'] > 0.5])
 
-    prompt = f"""上下文:\n{context}\n\n问题: {request.query}\n\n请提供详细回答，并在回答结束后，给出一个用于生成图表的JSON数据。
-    JSON数据应包含与回答相关的统计信息，格式如下:
-    {{
-        "title": {{"text": "图表标题"}},
-        "data": [
-            {{"name": "类别1", "value": 数值1}},
-            {{"name": "类别2", "value": 数值2}},
-            ...
-        ]
-    }}
-    请确保JSON数据与回答内容紧密相关。回答:"""
+    prompt = f"""基于以下上下文回答问题。请直接给出答案，不要重复问题。
 
-    response = zhipuai_wrapper.generate_response(request.query, prompt)
+上下文:
+{context}
+
+问题: {request.query}
+
+回答:"""
+
+    inference_start = time.time()
+    response = await zhipuai_wrapper.generate_response(request.query, prompt)
+    inference_end = time.time()
+    inference_time = inference_end - inference_start
 
     message_id = str(uuid.uuid4())
 
+    if DEBUG:
+        print(f"检索到的知识:")
+        for r in results:
+            if r['similarity'] > 0.5:
+                print(f"问题: {r['question']}")
+                print(f"答案: {r['answer']}")
+                print(f"相似度: {r['similarity']}")
+                print()
+        print(f"搜索时间: {search_time:.4f}秒")
+        print(f"推理时间: {inference_time:.4f}秒")
+        print(f"总时间: {search_time + inference_time:.4f}秒")
+
     async def stream_response():
-        full_response = ""
         try:
-            for chunk in response:
-                if hasattr(chunk.choices[0].delta, 'content'):
-                    content = chunk.choices[0].delta.content
-                    if content:
-                        full_response += content
-                        yield f"data: {json.dumps({'message_id': message_id, 'text': content}, ensure_ascii=False)}\n\n"
-            
-            # 提取JSON数据
-            json_match = re.search(r'\{[\s\S]*\}', full_response)
-            if json_match:
-                json_data = json.loads(json_match.group())
-                echarts_data = {
-                    'title': json_data['title'],
-                    'tooltip': {'trigger': 'item', 'formatter': '{a} <br/>{b} : {c} ({d}%)'},
-                    'legend': {'orient': 'vertical', 'left': 'left', 'data': [item['name'] for item in json_data['data']]},
-                    'series': [{
-                        'name': '统计数据',
-                        'type': 'pie',
-                        'radius': '55%',
-                        'center': ['50%', '60%'],
-                        'data': json_data['data'],
-                        'itemStyle': {
-                            'emphasis': {
-                                'shadowBlur': 10,
-                                'shadowOffsetX': 0,
-                                'shadowColor': 'rgba(0, 0, 0, 0.5)'
-                            }
-                        }
-                    }]
-                }
-                yield f"data: {json.dumps({'message_id': message_id, 'echarts': json.dumps(echarts_data)}, ensure_ascii=False)}\n\n"
+            if response is None:
+                fallback_response = "抱歉，我现在无法连接到AI服务。根据知识库，以下是一些相关信息：\n\n"
+                for r in results[:3]:
+                    fallback_response += f"- {r['answer']}\n"
+                fallback_response += "\n希望这些信息对您有帮助。如果您有更具体的问题，请随时告诉我。"
+                yield f"data: {json.dumps({'message_id': message_id, 'text': fallback_response}, ensure_ascii=False)}\n\n"
+            else:
+                full_response = ""
+                for chunk in response:
+                    if hasattr(chunk.choices[0].delta, 'content'):
+                        content = chunk.choices[0].delta.content
+                        if content:
+                            full_response += content
+                
+               
+                full_response = re.sub(r'\n{3,}', '\n\n', full_response)
+                full_response = re.sub(r'(^|\n)- ', '\n• ', full_response)
+                
+                yield f"data: {json.dumps({'message_id': message_id, 'text': full_response.strip()}, ensure_ascii=False)}\n\n"
+        
         except Exception as e:
             print(f"流式响应中出现错误: {str(e)}")
             yield f"data: {json.dumps({'message_id': message_id, 'error': str(e)}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(stream_response(), media_type="text/event-stream")
+
 
 if __name__ == "__main__":
     import uvicorn
