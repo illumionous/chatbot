@@ -1,168 +1,135 @@
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+import csv
 import json
-import os
-from fastapi import FastAPI, Query
+import logging
+from llama_index.retrievers.bm25 import BM25Retriever
+from fastapi import FastAPI
 from pydantic import BaseModel
 from zhipuai import ZhipuAI
-import uuid
-import jieba
+from llama_index.core import Document
+from llama_index.core.node_parser import SimpleNodeParser
 from fastapi.responses import StreamingResponse
-import asyncio
-import re
 import time
+import asyncio
 
-DEBUG = 1
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
 app = FastAPI()
 
 class KnowledgeBase:
     def __init__(self):
-        self.qa_pairs = []
-        self.vectorizer = TfidfVectorizer(tokenizer=self.chinese_tokenizer, token_pattern=None)
-        self.vectors = None
+        self.questions = []
+        self.bm25_retriever = None
+        self.qa_map = {}
 
-    def chinese_tokenizer(self, text):
-        return list(jieba.cut(text))
-
-    def load_qa_pairs(self, filename):
+    def load_questions(self, filename):
         with open(filename, 'r', encoding='utf-8') as f:
-            self.qa_pairs = json.load(f)
-        print(f"从 {filename} 加载了 {len(self.qa_pairs)} 个 QA 对")
+            self.questions = [line.strip() for line in f if line.strip()]
+        logger.info(f"Loaded {len(self.questions)} questions from {filename}")
+
+    def load_qa_map(self, filename):
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                content = f.read()
+                logger.debug(f"Content of {filename}: {content[:500]}...")  # Log the first 500 characters of the file
+                exec(content, globals())
+                self.qa_map = globals().get('QA_MAP', {})
+            logger.info(f"Loaded {len(self.qa_map)} QA pairs from {filename}")
+            logger.debug(f"First few QA pairs: {list(self.qa_map.items())[:3]}")
+            logger.debug(f"Keys in QA_MAP: {list(self.qa_map.keys())[:10]}")  # Log the first 10 keys
+        except Exception as e:
+            logger.error(f"Error loading QA_MAP from {filename}: {str(e)}")
+            self.qa_map = {}
 
     def vectorize(self):
-        questions = [qa['question'] for qa in self.qa_pairs]
-        self.vectors = self.vectorizer.fit_transform(questions)
-        print(f"向量化了 {len(questions)} 个问题")
-        print(f"词汇表大小: {len(self.vectorizer.vocabulary_)}")
-        print(f"向量形状: {self.vectors.shape}")
+        documents = [Document(text=question) for question in self.questions]
+        parser = SimpleNodeParser.from_defaults()
+        nodes = parser.get_nodes_from_documents(documents)
+        self.bm25_retriever = BM25Retriever.from_defaults(nodes=nodes, similarity_top_k=5)
+        logger.info(f"Indexed {len(self.questions)} questions using BM25")
 
-    def search(self, query, top_k=5):
-        query_vector = self.vectorizer.transform([query])
-        similarities = cosine_similarity(query_vector, self.vectors)[0]
+    def retrieve(self, query: str):
+        start_time = time.time()
+        results = self.bm25_retriever.retrieve(query)
         
-        sorted_indices = np.argsort(similarities)[::-1]
-        
-        results = []
-        seen_questions = set()
-        
-        for idx in sorted_indices:
-            if len(results) >= top_k:
-                break
+        if results:
+            retrieved_doc = {
+                "question": results[0].node.text,
+                "answer": self.qa_map.get(results[0].node.text, ""),
+                "score": results[0].score
+            }
+            logger.debug(f"resultsare: {results[0].node.text}")
+            logger.debug(f"Retrieved document: Question: {retrieved_doc['question'][:30]}... | Score: {retrieved_doc['score']:.4f}")
+            logger.debug(f"Retrieved answer: {retrieved_doc['answer'][:100]}...")  
             
-            question = self.qa_pairs[idx]["question"]
-            answer = self.qa_pairs[idx]["answer"]
-            
-            if question not in seen_questions:
-                results.append({
-                    "question": question,
-                    "answer": answer,
-                    "similarity": float(similarities[idx])
-                })
-                seen_questions.add(question)
+            if not retrieved_doc['answer']:
+                logger.warning(f"No answer found in QA_MAP for question: {retrieved_doc['question']}")
+        else:
+            retrieved_doc = None
+            logger.debug("No relevant document found")
         
-        return results
+        end_time = time.time()
+        logger.debug(f"Retrieval time: {end_time - start_time:.4f} seconds")
+        return retrieved_doc
+
 
 class ZhipuAIWrapper:
     def __init__(self, api_key):
         self.client = ZhipuAI(api_key=api_key)
 
-    async def generate_response(self, query, context):
-        prompt = f"上下文:\n{context}\n\n问题: {query}\n\n回答:"
-
-        try:
-            response = await asyncio.to_thread(
-                self.client.chat.completions.create,
-                model="glm-4-0520",
-                messages=[
-                    {"role": "system", "content": "你是一个有帮助的助手,来自九天大模型。使用提供的上下文来回答问题。"},
-                    {"role": "user", "content": prompt}
-                ],
-                stream=True
-            )
-            return response
-        except Exception as e:
-            print(f"ZhipuAI API error: {str(e)}")
-            return None
+    def generate_response(self, query, context):
+        prompt = f"Context:\n{context}\n\nQuestion: {query}\n\nAnswer:"
+        start_time = time.time()
+        response = self.client.chat.completions.create(
+            model="glm-4-0520",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant created by ZhipuAI."},
+                {"role": "user", "content": prompt}
+            ],
+            stream=True
+        )
+        end_time = time.time()
+        logger.debug(f"Initial inference time: {end_time - start_time:.4f} seconds")
+        return response
 
 class ChatRequest(BaseModel):
     query: str
 
-# 初始化知识库和ZhipuAI
 kb = KnowledgeBase()
-kb.load_qa_pairs("qa_pairs_10000.json")
+kb.load_questions("questions_only.txt")
+kb.load_qa_map("qamap.py")
 kb.vectorize()
 
 zhipuai_api_key = "3e6112341c28fb8f79f9a04fcd855881.8kHsVkSV3Z6GuVtA"
-if not zhipuai_api_key:
-    raise ValueError("请设置 ZHIPUAI_API_KEY 环境变量")
 zhipuai_wrapper = ZhipuAIWrapper(zhipuai_api_key)
 
 @app.post("/knowledge/chat")
 async def chat(request: ChatRequest):
-    search_start = time.time()
-    results = kb.search(request.query, top_k=5)
-    search_end = time.time()
-    search_time = search_end - search_start
+    start_time = time.time()
+    retrieved_doc = kb.retrieve(request.query)
     
-    context = "\n\n".join([f"Q: {r['question']}\nA: {r['answer']}" for r in results if r['similarity'] > 0.5])
+    if retrieved_doc is None:
+        return {"answer": "抱歉，我没有找到与您问题相关的信息。您能否换个方式提问，或者提供更多细节？"}
+    
+    if retrieved_doc['score'] >= 0.9 or retrieved_doc['question'] == request.query:
+        logger.debug(f"Found high relevance document: {retrieved_doc['question']} | Score: {retrieved_doc['score']:.4f}")
+        logger.debug(f"Returning answer: {retrieved_doc['answer']}")  # 添加这行
+        return {"answer": retrieved_doc['answer']}
+    
+    
+    context = f"Q: {retrieved_doc['question']}\nA: {retrieved_doc['answer']}"
+    prompt = f"Context:\n{context}\n\nQuestion: {request.query}\n\nAnswer:"
+    
+    response = await asyncio.to_thread(zhipuai_wrapper.generate_response, request.query, prompt)
+    
+    async def generate():
+        for chunk in response:
+            if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
 
-    prompt = f"""基于以下上下文回答问题。请直接给出答案，不要重复问题。
-
-上下文:
-{context}
-
-问题: {request.query}
-
-回答:"""
-
-    inference_start = time.time()
-    response = await zhipuai_wrapper.generate_response(request.query, prompt)
-    inference_end = time.time()
-    inference_time = inference_end - inference_start
-
-    message_id = str(uuid.uuid4())
-
-    if DEBUG:
-        print(f"检索到的知识:")
-        for r in results:
-            if r['similarity'] > 0.5:
-                print(f"问题: {r['question']}")
-                print(f"答案: {r['answer']}")
-                print(f"相似度: {r['similarity']}")
-                print()
-        print(f"搜索时间: {search_time:.4f}秒")
-        print(f"推理时间: {inference_time:.4f}秒")
-        print(f"总时间: {search_time + inference_time:.4f}秒")
-
-    async def stream_response():
-        try:
-            if response is None:
-                fallback_response = "抱歉，我现在无法连接到AI服务。根据知识库，以下是一些相关信息：\n\n"
-                for r in results[:3]:
-                    fallback_response += f"- {r['answer']}\n"
-                fallback_response += "\n希望这些信息对您有帮助。如果您有更具体的问题，请随时告诉我。"
-                yield f"data: {json.dumps({'message_id': message_id, 'text': fallback_response}, ensure_ascii=False)}\n\n"
-            else:
-                full_response = ""
-                for chunk in response:
-                    if hasattr(chunk.choices[0].delta, 'content'):
-                        content = chunk.choices[0].delta.content
-                        if content:
-                            full_response += content
-                
-               
-                full_response = re.sub(r'\n{3,}', '\n\n', full_response)
-                full_response = re.sub(r'(^|\n)- ', '\n• ', full_response)
-                
-                yield f"data: {json.dumps({'message_id': message_id, 'text': full_response.strip()}, ensure_ascii=False)}\n\n"
-        
-        except Exception as e:
-            print(f"流式响应中出现错误: {str(e)}")
-            yield f"data: {json.dumps({'message_id': message_id, 'error': str(e)}, ensure_ascii=False)}\n\n"
-
-    return StreamingResponse(stream_response(), media_type="text/event-stream")
-
+    end_time = time.time()
+    logger.debug(f"Total processing time: {end_time - start_time:.4f} seconds")
+    return StreamingResponse(generate(), media_type="text/plain")
 
 if __name__ == "__main__":
     import uvicorn
